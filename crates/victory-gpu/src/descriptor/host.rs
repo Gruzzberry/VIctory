@@ -315,6 +315,49 @@ impl HostHeap {
         Some((slot, gpu, cpu))
     }
 
+    /// As [`HostHeap::clear_texture_uav`] for an unordered access view of
+    /// a title buffer (`resource`, viewed by `words`), made on the buffer's
+    /// host copy, which it also returns. The host clears neither
+    /// structured views nor raw views with floats; a structured view whose
+    /// stride is whole words becomes a raw view of the same bytes, which a
+    /// clear with integers fills as the console fills the structured one
+    /// (the first value in every word).
+    pub(crate) fn clear_buffer_uav(
+        &self,
+        list: &crate::host::HostList,
+        resource: crate::object::This,
+        words: &[u32; 10],
+        float: bool,
+    ) -> Option<(
+        u32,
+        D3D12_GPU_DESCRIPTOR_HANDLE,
+        D3D12_CPU_DESCRIPTOR_HANDLE,
+        ID3D12Resource,
+    )> {
+        let (data, len) = crate::resource::buffer_bytes(resource)?;
+        let desc = raw_for_clear(uav_desc(words), float)?;
+        let cpu = list.clear_uav_cpu()?;
+        let buffer = buffer_uav(data as u64, len, desc, cpu)??;
+        let device = &host()?.device;
+        let slot = self.dynamic(1)?;
+        // SAFETY: both handles name live heap slots. Copy from the
+        // CPU-only heap to the shader-visible heap.
+        let gpu = unsafe {
+            device.CopyDescriptorsSimple(
+                1,
+                self.cpu(slot),
+                cpu,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: self.heap.GetGPUDescriptorHandleForHeapStart().ptr
+                    + u64::from(slot) * u64::from(self.step),
+            }
+        };
+        self.keep(slot, Some(buffer.clone()));
+        Some((slot, gpu, cpu, buffer))
+    }
+
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
@@ -464,6 +507,38 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+/// A buffer unordered access view the host can clear: typed views as they
+/// are, raw and structured ones (whose stride is whole words) as an
+/// `R32_UINT` view of the same words, which clears from any word where a
+/// raw view of the host's clear must begin on 16 bytes; `None` if the host
+/// cannot clear it, as with floats on either.
+fn raw_for_clear(
+    mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    float: bool,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let stride = buffer.StructureByteStride;
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    if stride == 0 && !raw {
+        return Some(desc);
+    }
+    if float || !stride.is_multiple_of(4) {
+        once!(stride, float, "a raw or structured buffer view the host cannot clear");
+        return None;
+    }
+    let words = (stride / 4).max(1);
+    buffer.FirstElement = buffer.FirstElement.checked_mul(u64::from(words))?;
+    buffer.NumElements = buffer.NumElements.checked_mul(words)?;
+    buffer.StructureByteStride = 0;
+    buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+    desc.Format = DXGI_FORMAT_R32_UINT;
+    Some(desc)
 }
 
 /// A buffer view of title memory at `address` on its host copy: the first

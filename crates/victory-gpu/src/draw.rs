@@ -487,6 +487,78 @@ impl State {
         }
     }
 
+    /// Records a clear of a title buffer's unordered access view in the
+    /// bound heap on the buffer's host copy, and brings what the clear
+    /// changed back to title memory like a shader's writes.
+    pub(crate) fn clear_buffer_uav(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        cpu: u64,
+        resource: This,
+        value: UavClear,
+        rects: &[RECT],
+    ) {
+        let heap_id = self.heaps[0];
+        if heap_id == 0 {
+            return;
+        }
+        let heap = crate::descriptor::heap(heap_id as This);
+        if heap.index(gpu).is_none() {
+            return;
+        }
+        let (Some(cpu_view), Some(gpu_view)) =
+            (crate::descriptor::view(cpu), crate::descriptor::view(gpu))
+        else {
+            return;
+        };
+        let (View::Unordered(cpu_resource, _, Some(words)), View::Unordered(gpu_resource, _, _)) =
+            (&cpu_view, &gpu_view)
+        else {
+            return;
+        };
+        if *cpu_resource != resource as usize
+            || gpu_resource != cpu_resource
+            || crate::resource::buffer_bytes(resource).is_none()
+        {
+            return;
+        }
+        let Some((address, len)) = crate::descriptor::host::buffer_range(&cpu_view) else {
+            return;
+        };
+        let (Some(shadow), Some(native_heap)) = (crate::shadow::find(address, len), heap.host())
+        else {
+            return;
+        };
+        let float = matches!(value, UavClear::Float(_));
+        let Some((slot, gpu, cpu, buffer)) =
+            native_heap.clear_buffer_uav(list, resource, words, float)
+        else {
+            return;
+        };
+        self.dynamic.push((heap_id, slot, 1));
+        self.bind_heaps(list);
+        // The copy first, so a clear to what a stale copy already holds
+        // still reaches title memory; then what the clear changes.
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+        // SAFETY: matched views of a live host buffer, whose shadow stays in
+        // common state (promoted implicitly), and the shader-visible
+        // descriptor's heap is bound on this list.
+        unsafe {
+            match value {
+                UavClear::Uint(values) => {
+                    list.list
+                        .ClearUnorderedAccessViewUint(gpu, cpu, &buffer, &values, rects);
+                }
+                UavClear::Float(values) => {
+                    list.list
+                        .ClearUnorderedAccessViewFloat(gpu, cpu, &buffer, &values, rects);
+                }
+            }
+        }
+    }
+
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.

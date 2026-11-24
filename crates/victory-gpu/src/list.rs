@@ -779,7 +779,13 @@ fn clear_uav(
         // SAFETY: the title passes count rectangles in the host's layout.
         unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
     };
-    with_state(this, |list, state| state.clear_texture_uav(list, gpu, cpu, resource, value, rects));
+    with_state(this, |list, state| {
+        if crate::resource::buffer_bytes(resource).is_some() {
+            state.clear_buffer_uav(list, gpu, cpu, resource, value, rects);
+        } else {
+            state.clear_texture_uav(list, gpu, cpu, resource, value, rects);
+        }
+    });
 }
 
 extern "system" fn clear_uav_uint(
@@ -1504,5 +1510,257 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// Clears of buffer unordered access views, run on the host GPU.
+    #[cfg(windows)]
+    mod buffer_clears {
+        use super::*;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        const SENTINEL: u32 = 0xAAAA_AAAA;
+        const WORDS: usize = 0x4000;
+        const R32_TYPELESS: u32 = 39;
+        const R32_FLOAT: u32 = 41;
+        const R32_UINT: u32 = 42;
+        const RAW: u32 = 1;
+
+        #[derive(Clone, Copy)]
+        enum Clear {
+            Uint([u32; 4]),
+            Float([f32; 4]),
+        }
+
+        /// The view description words of a buffer view.
+        fn view(format: u32, first: u32, count: u32, stride: u32, flags: u32) -> [u32; 10] {
+            [format, 1, first, 0, count, stride, 0, 0, flags, 0]
+        }
+
+        const fn rect(left: i32, right: i32) -> Rect {
+            Rect {
+                left,
+                top: 0,
+                right,
+                bottom: 1,
+            }
+        }
+
+        /// Title memory after a clear of `uav` over a buffer of `WORDS`
+        /// words that began as `SENTINEL`; `None` without a host GPU.
+        fn run(uav: [u32; 10], clear: Clear, rects: &[Rect]) -> Option<Vec<u32>> {
+            crate::host::host()?;
+            let null: This = std::ptr::null();
+            let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+            let mut memory = vec![SENTINEL; WORDS];
+            let device = crate::device::device();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Alignment: 0,
+                Width: (WORDS * 4) as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: Default::default(),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            };
+            type At = extern "system" fn(
+                This,
+                u64,
+                *const D3D12_RESOURCE_DESC,
+                u32,
+                *const std::ffi::c_void,
+                *const crate::object::Iid,
+                *mut This,
+            ) -> HRESULT;
+            let mut resource = null;
+            assert_eq!(
+                slot::<At>(device, 0x428)(
+                    device,
+                    memory.as_mut_ptr() as u64,
+                    &desc,
+                    u32::MAX,
+                    std::ptr::null(),
+                    &crate::resource::PAGEABLE_IIDS[0],
+                    &mut resource,
+                ),
+                S_OK
+            );
+
+            // A shader-visible view heap with the view in its first slot.
+            #[repr(C)]
+            struct Extended {
+                kind: u32,
+                count: u32,
+                flags: u32,
+                nodes: u32,
+                placement: [u64; 2],
+            }
+            let heap_desc = Extended {
+                kind: 0,
+                count: 16,
+                flags: 1,
+                nodes: 0,
+                placement: [0; 2],
+            };
+            let mut heap = null;
+            assert_eq!(
+                crate::descriptor::create_heap(
+                    null,
+                    (&raw const heap_desc).cast(),
+                    &crate::resource::PAGEABLE_IIDS[0],
+                    &mut heap,
+                ),
+                S_OK
+            );
+            let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+            crate::descriptor::create_uav(null, resource, null, &uav, handle);
+
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            state::heaps(list, 1, &raw const heap);
+            let count = rects.len() as u32;
+            match clear {
+                Clear::Uint(v) => {
+                    clear_uav_uint(list, handle, handle, resource, &v, count, rects.as_ptr())
+                }
+                Clear::Float(v) => {
+                    clear_uav_float(list, handle, handle, resource, &v, count, rects.as_ptr())
+                }
+            }
+            assert_eq!(close(list), S_OK);
+            crate::host::host()
+                .unwrap()
+                .execute(&[host_list(list).unwrap()]);
+
+            let words = (0..WORDS)
+                // SAFETY: in bounds; the host wrote to this memory behind the Vec.
+                .map(|i| unsafe { memory.as_ptr().add(i).read_volatile() })
+                .collect();
+            release(list);
+            release(allocator);
+            release(heap);
+            release(resource);
+            Some(words)
+        }
+
+        /// Words other than `changed` still hold the sentinel.
+        fn assert_untouched(words: &[u32], changed: std::ops::Range<usize>) {
+            for (i, &w) in words.iter().enumerate() {
+                if !changed.contains(&i) {
+                    assert_eq!(w, SENTINEL, "word {i} outside the clear changed");
+                }
+            }
+        }
+
+        #[test]
+        fn raw_view_uint_clear() {
+            let uav = view(R32_TYPELESS, 4, 8, 0, RAW);
+            let Some(words) = run(uav, Clear::Uint([0x1234_5678, 1, 2, 3]), &[]) else {
+                return;
+            };
+            assert!(
+                words[4..12].iter().all(|&w| w == 0x1234_5678),
+                "{:x?}",
+                &words[..16]
+            );
+            assert_untouched(&words, 4..12);
+        }
+
+        #[test]
+        fn raw_view_uint_clear_from_an_odd_word() {
+            let uav = view(R32_TYPELESS, 1, 5, 0, RAW);
+            let Some(words) = run(uav, Clear::Uint([0x1234_5678, 1, 2, 3]), &[]) else {
+                return;
+            };
+            assert!(words[1..6].iter().all(|&w| w == 0x1234_5678), "{:x?}", &words[..8]);
+            assert_untouched(&words, 1..6);
+        }
+
+        #[test]
+        fn structured_view_uint_clear_from_an_odd_element() {
+            let uav = view(0, 1, 3, 8, 0);
+            let Some(words) = run(uav, Clear::Uint([0xCAFE_0001, 5, 6, 7]), &[]) else {
+                return;
+            };
+            assert!(words[2..8].iter().all(|&w| w == 0xCAFE_0001), "{:x?}", &words[..10]);
+            assert_untouched(&words, 2..8);
+        }
+
+        #[test]
+        fn structured_view_uint_clear_fills_every_word() {
+            // Eight elements of 8 bytes from element 2: words 4..20.
+            let uav = view(0, 2, 8, 8, 0);
+            let Some(words) = run(uav, Clear::Uint([0xCAFE_0001, 5, 6, 7]), &[]) else {
+                return;
+            };
+            assert!(
+                words[4..20].iter().all(|&w| w == 0xCAFE_0001),
+                "{:x?}",
+                &words[..24]
+            );
+            assert_untouched(&words, 4..20);
+        }
+
+        #[test]
+        fn typed_view_clears_a_rect() {
+            // Sixteen R32_UINT elements from element 8; the rect covers
+            // elements 4..10 of the view: words 12..18.
+            let uav = view(R32_UINT, 8, 16, 0, 0);
+            let Some(words) = run(uav, Clear::Uint([7, 0, 0, 0]), &[rect(4, 10)]) else {
+                return;
+            };
+            assert!(words[12..18].iter().all(|&w| w == 7), "{:x?}", &words[..28]);
+            assert_untouched(&words, 12..18);
+        }
+
+        #[test]
+        fn typed_float_view_float_clear() {
+            let uav = view(R32_FLOAT, 3, 5, 0, 0);
+            let Some(words) = run(uav, Clear::Float([1.5, 0.0, 0.0, 0.0]), &[]) else {
+                return;
+            };
+            assert!(
+                words[3..8].iter().all(|&w| w == 0x3FC0_0000),
+                "{:x?}",
+                &words[..12]
+            );
+            assert_untouched(&words, 3..8);
+        }
+
+        #[test]
+        fn float_clear_of_a_raw_view_is_refused() {
+            let uav = view(R32_TYPELESS, 0, 8, 0, RAW);
+            let Some(words) = run(uav, Clear::Float([1.5, 0.0, 0.0, 0.0]), &[]) else {
+                return;
+            };
+            assert_untouched(&words, 0..0);
+        }
+
+        #[test]
+        fn float_clear_of_a_structured_view_is_refused() {
+            let uav = view(0, 0, 8, 8, 0);
+            let Some(words) = run(uav, Clear::Float([1.5, 0.0, 0.0, 0.0]), &[]) else {
+                return;
+            };
+            assert_untouched(&words, 0..0);
+        }
     }
 }
