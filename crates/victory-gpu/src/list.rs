@@ -1732,6 +1732,18 @@ mod tests {
         }
 
         #[test]
+        fn structured_view_clears_a_rect_in_elements() {
+            // Eight elements of 8 bytes from element 2; the rect covers
+            // elements 1..3 of the view: bytes 24..40, words 6..10.
+            let uav = view(0, 2, 8, 8, 0);
+            let Some(words) = run(uav, Clear::Uint([9, 0, 0, 0]), &[rect(1, 3)]) else {
+                return;
+            };
+            assert!(words[6..10].iter().all(|&w| w == 9), "{:x?}", &words[..16]);
+            assert_untouched(&words, 6..10);
+        }
+
+        #[test]
         fn typed_float_view_float_clear() {
             let uav = view(R32_FLOAT, 3, 5, 0, 0);
             let Some(words) = run(uav, Clear::Float([1.5, 0.0, 0.0, 0.0]), &[]) else {

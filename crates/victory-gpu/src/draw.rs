@@ -531,6 +531,22 @@ impl State {
             return;
         };
         let float = matches!(value, UavClear::Float(_));
+        // A structured view is cleared as a raw one of the same bytes, whose
+        // elements are words: the rectangles' element ranges grow with them.
+        let scale = i32::try_from(words[5] / 4).map_or(1, |n| n.max(1));
+        let scaled: Option<Vec<RECT>> = rects
+            .iter()
+            .map(|r| {
+                Some(RECT {
+                    left: r.left.checked_mul(scale)?,
+                    right: r.right.checked_mul(scale)?,
+                    ..*r
+                })
+            })
+            .collect();
+        let Some(rects) = scaled else {
+            return;
+        };
         let Some((slot, gpu, cpu, buffer)) =
             native_heap.clear_buffer_uav(list, resource, words, float)
         else {
@@ -549,11 +565,11 @@ impl State {
             match value {
                 UavClear::Uint(values) => {
                     list.list
-                        .ClearUnorderedAccessViewUint(gpu, cpu, &buffer, &values, rects);
+                        .ClearUnorderedAccessViewUint(gpu, cpu, &buffer, &values, &rects);
                 }
                 UavClear::Float(values) => {
                     list.list
-                        .ClearUnorderedAccessViewFloat(gpu, cpu, &buffer, &values, rects);
+                        .ClearUnorderedAccessViewFloat(gpu, cpu, &buffer, &values, &rects);
                 }
             }
         }
