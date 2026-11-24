@@ -276,6 +276,127 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    const MIB: usize = 1 << 20;
+
+    /// Eight MiB of address space: committed read-write in the first two and
+    /// last two MiB, reserved only in the next two, committed but without
+    /// access in the two after that.
+    struct Pool(*mut u8);
+
+    impl Pool {
+        fn new() -> Pool {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            };
+            // SAFETY: plain allocations of our own address space, committed
+            // inside the reservation.
+            unsafe {
+                let base = VirtualAlloc(std::ptr::null(), 8 * MIB, MEM_RESERVE, PAGE_READWRITE);
+                assert!(!base.is_null());
+                let base = base.cast::<u8>();
+                for (from, size, protect) in [
+                    (0, 2 * MIB, PAGE_READWRITE),
+                    (4 * MIB, 2 * MIB, PAGE_NOACCESS),
+                    (6 * MIB, 2 * MIB, PAGE_READWRITE),
+                ] {
+                    let at = base.add(from).cast();
+                    assert!(!VirtualAlloc(at, size, MEM_COMMIT, protect).is_null());
+                }
+                Pool(base)
+            }
+        }
+
+        fn mapped(&self) -> [std::ops::Range<usize>; 2] {
+            [0..2 * MIB, 6 * MIB..8 * MIB]
+        }
+    }
+
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // SAFETY: the base of our reservation.
+            unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    fn pattern(i: usize) -> u8 {
+        (i % 251) as u8 + 1
+    }
+
+    #[test]
+    fn copy_reads_what_is_mapped_and_zeros_holes() {
+        let pool = Pool::new();
+        for range in pool.mapped() {
+            for i in range {
+                // SAFETY: committed read-write memory of the pool.
+                unsafe { pool.0.add(i).write(pattern(i)) };
+            }
+        }
+        let mut copy = vec![0xEE; 8 * MIB];
+        copy_mapped(copy.as_mut_ptr(), pool.0, 8 * MIB, false);
+        for (i, &b) in copy.iter().enumerate() {
+            let mapped = pool.mapped().iter().any(|r| r.contains(&i));
+            assert_eq!(b, if mapped { pattern(i) } else { 0 }, "byte {i:#x}");
+        }
+        // A range that starts and ends inside regions of different kinds.
+        let mut copy = vec![0xEE; 3 * MIB];
+        copy_mapped(
+            copy.as_mut_ptr(),
+            pool.0.wrapping_add(MIB + 100),
+            3 * MIB,
+            false,
+        );
+        for (i, &b) in copy.iter().enumerate() {
+            let at = MIB + 100 + i;
+            let mapped = pool.mapped().iter().any(|r| r.contains(&at));
+            assert_eq!(b, if mapped { pattern(at) } else { 0 }, "byte {at:#x}");
+        }
+    }
+
+    #[test]
+    fn write_back_leaves_holes_alone() {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        let pool = Pool::new();
+        let host = vec![0x77u8; 8 * MIB];
+        write_mapped(pool.0, host.as_ptr(), 8 * MIB);
+        let mut old = 0;
+        // SAFETY: the pool's no-access stretch, made readable to look at it.
+        unsafe {
+            VirtualProtect(
+                pool.0.add(4 * MIB).cast(),
+                2 * MIB,
+                PAGE_READWRITE,
+                &mut old,
+            )
+        };
+        for i in (0..8 * MIB).step_by(4099) {
+            if (2 * MIB..4 * MIB).contains(&i) {
+                continue; // only reserved: nothing to look at
+            }
+            let mapped = pool.mapped().iter().any(|r| r.contains(&i));
+            // SAFETY: committed memory of the pool.
+            let b = unsafe { pool.0.add(i).read() };
+            assert_eq!(b, if mapped { 0x77 } else { 0 }, "byte {i:#x}");
+        }
+    }
+
+    /// Timing, with the numbers in the log: `cargo test -p victory-gpu
+    /// copy_with_a_hole -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn copy_with_a_hole_takes_a_few_queries() {
+        let pool = Pool::new();
+        let mut copy = vec![0u8; 8 * MIB];
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            copy_mapped(copy.as_mut_ptr(), pool.0, 8 * MIB, false);
+        }
+        eprintln!(
+            "8 MiB range with a 4 MiB hole: {:?} a copy",
+            started.elapsed() / 100
+        );
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -1291,7 +1412,8 @@ impl Batch {
 /// The source is read through the kernel (`ReadProcessMemory`), which
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// tables to the region's end), which made copies run at 100-200 MB/s; it is
+/// asked only when a read fails.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -1320,20 +1442,36 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
+    // Something is unmapped: by the regions of the address space the kernel
+    // reports (a region of a big pool is megabytes long), zeros for what
+    // cannot be read.
+    for_regions(src as usize, len, |at, n, access| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
+        if access && read(at as *const u8, to, n) {
+            return;
+        }
+        if access {
+            // The query says readable, the kernel disagrees (a guard page, a
+            // page unmapped since): page by page, zeros for what fails.
+            for_pieces(at, n, 64 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
                 if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    for_pieces(at, n, 4 << 10, |at, n| {
+                        let to = dst.wrapping_add(at - src as usize);
+                        if !read(at as *const u8, to, n) {
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                            // SAFETY: inside the destination, which is mapped.
+                            unsafe { to.write_bytes(0, n) };
+                        }
+                    });
                 }
             });
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
         }
     });
 }
@@ -1370,13 +1508,46 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 || write(dst as usize, len) {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+    for_regions(dst as usize, len, |at, n, access| {
+        if access && !write(at, n) {
+            for_pieces(at, n, 64 << 10, |at, n| {
+                if !write(at, n) {
+                    for_pieces(at, n, 4 << 10, |at, n| {
+                        write(at, n);
+                    });
+                }
             });
         }
     });
+}
+
+/// Calls `f` with the stretches of `[start, start + len)` that lie in one
+/// region of the address space and whether its pages can be accessed at all
+/// (committed, and not `PAGE_NOACCESS`): one query per region, not one kernel
+/// call per piece. A query that fails counts as accessible.
+fn for_regions(start: usize, len: usize, mut f: impl FnMut(usize, usize, bool)) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let found = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if found == 0 {
+            f(at, end - at, true);
+            return;
+        }
+        let next = (info.BaseAddress as usize + info.RegionSize).clamp(at + 1, end);
+        f(
+            at,
+            next - at,
+            info.State == MEM_COMMIT && info.Protect & PAGE_NOACCESS == 0,
+        );
+        at = next;
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
